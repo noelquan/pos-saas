@@ -13,6 +13,9 @@ import {
   Sun,
   Moon,
 } from "lucide-react";
+import { useRouter } from "next/navigation";
+import { supabase } from "../../lib/supabaseClient";
+
 
 // ✅ Adjust this import path if needed.
 // Example alternatives:
@@ -45,6 +48,9 @@ export default function POSApp() {
   const [editingTransaction, setEditingTransaction] = useState(null);
   const [showReceipt, setShowReceipt] = useState(false);
   const [showInvoice, setShowInvoice] = useState(false);
+  const router = useRouter();
+  const [authChecking, setAuthChecking] = useState(true);
+
 
   // New item form
   const [newItem, setNewItem] = useState({
@@ -95,20 +101,58 @@ export default function POSApp() {
     setTransactions(sorted);
   };
 
-  useEffect(() => {
-    (async () => {
-      try {
-        const s = await ensureShop();
-        setShop(s);
-        await refreshFromSupabase(s.id);
-      } catch (e) {
-        console.error(e);
-        alert(e?.message || String(e));
-      } finally {
-        setLoading(false);
-      }
-    })();
-  }, []);
+useEffect(() => {
+  if (authChecking) return; // wait until auth is confirmed
+
+  (async () => {
+    try {
+      const s = await ensureShop();
+      setShop(s);
+      await refreshFromSupabase(s.id);
+    } catch (e) {
+      console.error(e);
+      alert(e?.message || String(e));
+    } finally {
+      setLoading(false);
+    }
+  })();
+}, [authChecking]);
+
+
+useEffect(() => {
+  let alive = true;
+
+  (async () => {
+    const { data, error } = await supabase.auth.getSession();
+    if (!alive) return;
+
+    if (error) {
+      console.error(error);
+      router.replace("/login");
+      return;
+    }
+
+    if (!data?.session) {
+      router.replace("/login");
+      return;
+    }
+
+    setAuthChecking(false);
+  })();
+
+  const { data: sub } = supabase.auth.onAuthStateChange((_event, session) => {
+    if (!session) router.replace("/login");
+  });
+
+  return () => {
+    alive = false;
+    sub?.subscription?.unsubscribe();
+  };
+}, [router]);
+
+if (authChecking) {
+  return <div className="min-h-screen p-6">Checking login...</div>;
+}
 
   // ---------- Items (Supabase) ----------
   const saveItems = async (newItems) => {
@@ -588,6 +632,9 @@ export default function POSApp() {
   // Everything below this point is your UI exactly as provided (unchanged),
   // except it now uses Supabase-backed state + functions above.
   // -------------------------
+
+
+  
 
   // CALENDAR VIEW
   if (showCalendar) {

@@ -1,436 +1,515 @@
 "use client";
-import React, { useState, useEffect } from 'react';
-import { X, Calendar, Edit2, Trash2, Save, Receipt, FileText, List, Package, Settings, Sun, Moon } from 'lucide-react';
+import React, { useEffect, useState } from "react";
+import {
+  X,
+  Calendar,
+  Edit2,
+  Trash2,
+  Save,
+  Receipt,
+  FileText,
+  List,
+  Package,
+  Settings,
+  Sun,
+  Moon,
+} from "lucide-react";
 
+import {
+  ensureShop,
+  loadItems,
+  replaceItems,
+  loadTransactions,
+  insertTransaction,
+  updateTransaction,
+  nextDailyNumber,
+} from "../../lib/storage";
 
 export default function POSApp() {
   const [items, setItems] = useState([]);
   const [transactions, setTransactions] = useState([]);
+
   const [showItemManager, setShowItemManager] = useState(false);
   const [showCalendar, setShowCalendar] = useState(false);
   const [showTransactions, setShowTransactions] = useState(false);
   const [showReceiptsView, setShowReceiptsView] = useState(false);
   const [showInvoicesView, setShowInvoicesView] = useState(false);
+
   const [selectedDate, setSelectedDate] = useState(null);
   const [calendarMonth, setCalendarMonth] = useState(new Date());
+
   const [viewingTransaction, setViewingTransaction] = useState(null);
   const [editingTransaction, setEditingTransaction] = useState(null);
+
   const [showReceipt, setShowReceipt] = useState(false);
   const [showInvoice, setShowInvoice] = useState(false);
-  
+
   // New item form
-  const [newItem, setNewItem] = useState({ name: '', price: '', category: '' });
-  
+  const [newItem, setNewItem] = useState({ name: "", price: "", category: "" });
+
   // Current sale
   const [currentSale, setCurrentSale] = useState([]);
-  const [paymentMethod, setPaymentMethod] = useState('cash');
-  const [customerName, setCustomerName] = useState('');
+  const [paymentMethod, setPaymentMethod] = useState("cash");
+  const [customerName, setCustomerName] = useState("");
+
   const [showQuickItem, setShowQuickItem] = useState(false);
-  const [quickItem, setQuickItem] = useState({ name: '', price: '', quantity: 1 });
+  const [quickItem, setQuickItem] = useState({ name: "", price: "", quantity: 1 });
+
   const [showCashModal, setShowCashModal] = useState(false);
-  const [cashTransaction, setCashTransaction] = useState({ type: 'out', reason: '', amount: '' });
+  const [cashTransaction, setCashTransaction] = useState({ type: "out", reason: "", amount: "" });
+
   const [isProcessing, setIsProcessing] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [darkMode, setDarkMode] = useState(false);
 
-  // -----------------------------
-  // Ledger helpers (keep UI lean)
-  // -----------------------------
+  const [shop, setShop] = useState(null);
+  const [loading, setLoading] = useState(true);
 
+  // -----------------------------
+  // Small utils
+  // -----------------------------
   const clampInt = (value, min, fallback) => {
     const n = parseInt(value, 10);
     if (Number.isNaN(n)) return fallback;
     return Math.max(min, n);
   };
 
-  const makeId = (prefix = 'id') => {
+  const toNum = (v, fallback = 0) => {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : fallback;
+  };
+
+  const money = (v) => toNum(v, 0).toFixed(2);
+
+  const makeId = (prefix = "id") => {
     try {
-      if (typeof crypto !== 'undefined' && crypto.randomUUID) return `${prefix}_${crypto.randomUUID()}`;
+      if (typeof crypto !== "undefined" && crypto.randomUUID) return `${prefix}_${crypto.randomUUID()}`;
     } catch (_) {
       // ignore
     }
     return `${prefix}_${Date.now()}_${Math.random().toString(16).slice(2)}`;
   };
 
-  const computeTransactionTotal = (tx) => (tx.items || []).reduce((sum, i) => sum + (Number(i.subtotal) || 0), 0);
+  const persistThemeLocal = (value) => {
+    try {
+      localStorage.setItem("pos-dark-mode", JSON.stringify(!!value));
+    } catch (_) {
+      // non-fatal
+    }
+  };
 
+  const loadThemeLocal = () => {
+    try {
+      const raw = localStorage.getItem("pos-dark-mode");
+      if (!raw) return null;
+      return Boolean(JSON.parse(raw));
+    } catch (_) {
+      return null;
+    }
+  };
+
+  const refreshAll = async (shopId) => {
+    const [loadedItems, loadedTxs] = await Promise.all([loadItems(shopId), loadTransactions(shopId)]);
+    setItems(Array.isArray(loadedItems) ? loadedItems : []);
+    setTransactions(
+      (Array.isArray(loadedTxs) ? loadedTxs : []).slice().sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
+    );
+  };
+
+  // -----------------------------
+  // Ledger helper (recompute from scratch every render)
+  // -----------------------------
   const computeDailySummary = (txs) => {
-    // Always recompute from scratch each render.
-    // Sort to ensure edits to timestamps are reflected in running balances.
     const sorted = [...txs].sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
 
     let runningBalance = 0;
-    const summary = [];
+    const rows = [];
 
     sorted.forEach((tx) => {
-      tx.items.forEach((item, idx) => {
-        const isCash = tx.paymentMethod === 'cash' && !tx.cancelled;
-        if (isCash) runningBalance += item.subtotal;
+      const itemsArr = Array.isArray(tx.items) ? tx.items : [];
+      const cancelled = !!tx.cancelled;
+      const isCash = tx.paymentMethod === "cash" && !cancelled;
 
-        summary.push({
+      // If a tx somehow has no items, still show a single row so it’s clickable/visible.
+      const safeItems = itemsArr.length > 0 ? itemsArr : [{ name: "(no items)", quantity: 0, price: 0, subtotal: toNum(tx.total, 0) }];
+
+      safeItems.forEach((item, idx) => {
+        const sub = toNum(item.subtotal, toNum(item.price, 0) * toNum(item.quantity, 0));
+        if (isCash) runningBalance += sub;
+
+        rows.push({
           txId: tx.id,
           timestamp: tx.timestamp,
-          item,
+          item: {
+            ...item,
+            quantity: toNum(item.quantity, 0),
+            price: toNum(item.price, 0),
+            subtotal: sub,
+          },
           itemIndex: idx,
-          totalItems: tx.items.length,
+          totalItems: safeItems.length,
           paymentMethod: tx.paymentMethod,
-          cancelled: tx.cancelled,
-          edited: tx.editHistory.length > 0,
-          type: tx.type || 'sale',
-          runningBalance: isCash ? runningBalance : null
+          cancelled,
+          edited: (tx.editHistory || []).length > 0,
+          type: tx.type || "sale",
+          runningBalance: isCash ? runningBalance : null,
         });
       });
     });
 
-    return { sortedTxs: sorted, rows: summary };
+    return { sortedTxs: sorted, rows };
   };
 
-  // Generate receipt/invoice number in format YYMMDDNNNN (safe counter per day)
-  const generateNumber = async () => {
-    const now = new Date();
-    const year = now.getFullYear().toString().slice(-2);
-    const month = (now.getMonth() + 1).toString().padStart(2, '0');
-    const day = now.getDate().toString().padStart(2, '0');
-    const prefix = `${year}${month}${day}`;
-
-    const counterKey = `pos-counter:${prefix}`;
-    const last = await window.storage.get(counterKey);
-    const lastNum = last ? Number(last.value) : 0;
-    const next = Number.isFinite(lastNum) ? lastNum + 1 : 1;
-    await window.storage.set(counterKey, String(next));
-
-    return `${prefix}${String(next).padStart(4, '0')}`;
-  };
-
-  // Load data on mount
+  // -----------------------------
+  // Init: shop + items + txs
+  // -----------------------------
   useEffect(() => {
-    loadData();
+    (async () => {
+      try {
+        const localTheme = loadThemeLocal();
+        if (localTheme !== null) setDarkMode(localTheme);
+
+        const s = await ensureShop();
+        setShop(s);
+
+        await refreshAll(s.id);
+      } catch (err) {
+        alert(err?.message || String(err));
+      } finally {
+        setLoading(false);
+      }
+    })();
   }, []);
 
-  // Persist theme
   useEffect(() => {
-    (async () => {
-      try {
-        await window.storage.set('pos-dark-mode', JSON.stringify(darkMode));
-      } catch (e) {
-        // Non-fatal
-        console.warn('Failed to persist theme:', e);
-      }
-    })();
+    persistThemeLocal(darkMode);
   }, [darkMode]);
 
-  const loadData = async () => {
-    try {
-      const themeResult = await window.storage.get('pos-dark-mode');
-      if (themeResult) setDarkMode(Boolean(JSON.parse(themeResult.value)));
+  if (loading) return <div className="p-6">Loading...</div>;
 
-      const itemsResult = await window.storage.get('pos-items');
-      if (itemsResult) setItems(JSON.parse(itemsResult.value));
-      
-      const txResult = await window.storage.list('tx:');
-      if (txResult && txResult.keys) {
-        const txs = [];
-        for (const key of txResult.keys) {
-          const data = await window.storage.get(key);
-          if (data) txs.push(JSON.parse(data.value));
-        }
-        txs.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
-        setTransactions(txs);
-      }
-    } catch (error) {
-      console.log('No data found:', error);
+  // -----------------------------
+  // Items CRUD (Supabase)
+  // -----------------------------
+  const saveItemsSupabase = async (newItems) => {
+    if (!shop) throw new Error("Shop not ready");
+    const prev = items;
+    setItems(newItems);
+    try {
+      await replaceItems(shop.id, newItems);
+      // Keep canonical (in case server normalizes)
+      await refreshAll(shop.id);
+    } catch (e) {
+      setItems(prev); // rollback UI if save fails
+      throw e;
     }
   };
 
-  // Persist theme choice
-  useEffect(() => {
-    (async () => {
-      try {
-        await window.storage.set('pos-dark-mode', JSON.stringify(darkMode));
-      } catch (_) {
-        // non-fatal
-      }
-    })();
-  }, [darkMode]);
-
-  const saveItems = async (newItems) => {
-    try {
-      console.log('Saving items:', newItems);
-      await window.storage.set('pos-items', JSON.stringify(newItems));
-      setItems(newItems);
-      console.log('Items saved successfully');
-    } catch (error) {
-      console.error('Error saving items:', error);
-      alert('Error saving items: ' + error.message);
-    }
-  };
-
-  const addItem = () => {
+  const addItem = async () => {
     if (!newItem.name || !newItem.price) {
-      alert('Please enter item name and price');
+      alert("Please enter item name and price");
       return;
     }
+
     const item = {
-      id: Date.now(),
+      id: makeId("item"),
       name: newItem.name,
-      price: parseFloat(newItem.price),
-      category: newItem.category || 'General'
+      price: toNum(newItem.price, 0),
+      category: newItem.category || "General",
     };
-    saveItems([...items, item]);
-    setNewItem({ name: '', price: '', category: '' });
+
+    try {
+      await saveItemsSupabase([...items, item]);
+      setNewItem({ name: "", price: "", category: "" });
+    } catch (e) {
+      alert("Error saving items: " + (e?.message || String(e)));
+    }
   };
 
   const deleteItem = async (id) => {
-    console.log('Delete item called with id:', id);
-    console.log('Current items:', items);
-    
-    const newItems = items.filter(i => i.id !== id);
-    console.log('New items after filter:', newItems);
-    await saveItems(newItems);
+    try {
+      const newItems = items.filter((i) => i.id !== id);
+      await saveItemsSupabase(newItems);
+    } catch (e) {
+      alert("Error deleting item: " + (e?.message || String(e)));
+    }
   };
 
+  // -----------------------------
+  // Sale helpers
+  // -----------------------------
   const addToSale = (item) => {
-    const existing = currentSale.find(i => i.id === item.id);
+    const existing = currentSale.find((i) => i.id === item.id);
     if (existing) {
-      setCurrentSale(currentSale.map(i => 
-        i.id === item.id ? { ...i, quantity: i.quantity + 1 } : i
-      ));
+      setCurrentSale(currentSale.map((i) => (i.id === item.id ? { ...i, quantity: i.quantity + 1 } : i)));
     } else {
       setCurrentSale([...currentSale, { ...item, quantity: 1 }]);
     }
   };
 
+  const updateQuantity = (id, quantity) => {
+    if (quantity <= 0) {
+      setCurrentSale(currentSale.filter((i) => i.id !== id));
+    } else {
+      setCurrentSale(currentSale.map((i) => (i.id === id ? { ...i, quantity } : i)));
+    }
+  };
+
   const addQuickItemToSale = () => {
     if (!quickItem.name || !quickItem.price || !quickItem.quantity) {
-      alert('Please fill in all fields');
+      alert("Please fill in all fields");
       return;
     }
 
     const tempItem = {
-      id: makeId('quick'),
+      id: makeId("quick"),
       name: quickItem.name,
-      price: parseFloat(quickItem.price),
+      price: toNum(quickItem.price, 0),
       quantity: clampInt(quickItem.quantity, 1, 1),
-      category: 'Quick Sale'
+      category: "Quick Sale",
     };
 
     setCurrentSale([...currentSale, tempItem]);
-    setQuickItem({ name: '', price: '', quantity: 1 });
+    setQuickItem({ name: "", price: "", quantity: 1 });
     setShowQuickItem(false);
   };
 
+  // -----------------------------
+  // Cash In/Out (Supabase tx)
+  // -----------------------------
   const recordCashTransaction = async () => {
+    if (!shop) return alert("Shop not ready yet");
     if (!cashTransaction.reason || !cashTransaction.amount) {
-      alert('Please enter reason and amount');
+      alert("Please enter reason and amount");
       return;
     }
 
-    const amount = parseFloat(cashTransaction.amount);
-    if (isNaN(amount) || amount <= 0) {
-      alert('Please enter a valid amount');
+    const amount = toNum(cashTransaction.amount, NaN);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      alert("Please enter a valid amount");
       return;
     }
 
     setIsProcessing(true);
-    
+
     try {
-      const number = await generateNumber();
-      const txId = makeId('tx');
-      
+      const number = await nextDailyNumber(shop.id);
+      const txId = makeId("tx");
+
+      const isOut = cashTransaction.type === "out";
+      const signed = isOut ? -amount : amount;
+
       const transaction = {
         id: txId,
         timestamp: new Date().toISOString(),
-        customerName: '',
-        items: [{
-          name: `Cash ${cashTransaction.type === 'out' ? 'Out' : 'In'}: ${cashTransaction.reason}`,
-          price: cashTransaction.type === 'out' ? -amount : amount,
-          quantity: 1,
-          subtotal: cashTransaction.type === 'out' ? -amount : amount
-        }],
-        total: cashTransaction.type === 'out' ? -amount : amount,
-        paymentMethod: 'cash',
+        customerName: "",
+        items: [
+          {
+            name: `Cash ${isOut ? "Out" : "In"}: ${cashTransaction.reason}`,
+            price: signed,
+            quantity: 1,
+            subtotal: signed,
+          },
+        ],
+        total: signed,
+        paymentMethod: "cash",
         receiptNumber: number,
+        invoiceNumber: null,
         editHistory: [],
         cancelled: false,
         isCashTransaction: true,
         cashType: cashTransaction.type,
-        type: cashTransaction.type === 'out' ? 'cash-out' : 'cash-in'
+        type: isOut ? "cash-out" : "cash-in",
       };
 
-      await window.storage.set(`tx:${transaction.id}`, JSON.stringify(transaction));
-      await loadData();
-      setCashTransaction({ type: 'out', reason: '', amount: '' });
+      await insertTransaction(shop.id, transaction);
+      await refreshAll(shop.id);
+
+      setCashTransaction({ type: "out", reason: "", amount: "" });
       setShowCashModal(false);
       alert(`Cash ${cashTransaction.type} recorded! Receipt #${number}`);
     } catch (error) {
-      console.error('Error saving cash transaction:', error);
-      alert('Failed to save cash transaction');
+      console.error("Error saving cash transaction:", error);
+      alert("Failed to save cash transaction: " + (error?.message || String(error)));
     } finally {
       setIsProcessing(false);
     }
   };
 
-  const updateQuantity = (id, quantity) => {
-    if (quantity <= 0) {
-      setCurrentSale(currentSale.filter(i => i.id !== id));
-    } else {
-      setCurrentSale(currentSale.map(i => 
-        i.id === id ? { ...i, quantity } : i
-      ));
-    }
-  };
-
+  // -----------------------------
+  // Complete Sale (Supabase tx)
+  // -----------------------------
   const completeSale = async () => {
+    if (!shop) return alert("Shop not ready yet");
     if (currentSale.length === 0) {
-      alert('No items in sale');
+      alert("No items in sale");
       return;
     }
 
-    if (paymentMethod === 'credit' && !customerName.trim()) {
-      alert('Customer name is required for credit sales');
+    if (paymentMethod === "credit" && !customerName.trim()) {
+      alert("Customer name is required for credit sales");
       return;
     }
 
     setIsProcessing(true);
-    
+
     try {
-      const number = await generateNumber();
-      const txId = makeId('tx');
-      
+      const number = await nextDailyNumber(shop.id);
+      const txId = makeId("tx");
+
+      const txItems = currentSale.map((i) => {
+        const price = toNum(i.price, 0);
+        const qty = toNum(i.quantity, 0);
+        return {
+          name: i.name,
+          price,
+          quantity: qty,
+          subtotal: price * qty,
+        };
+      });
+
+      const total = txItems.reduce((sum, i) => sum + toNum(i.subtotal, 0), 0);
+
       const transaction = {
         id: txId,
         timestamp: new Date().toISOString(),
         customerName: customerName.trim(),
-        items: currentSale.map(i => ({
-          name: i.name,
-          price: i.price,
-          quantity: i.quantity,
-          subtotal: i.price * i.quantity
-        })),
-        total: currentSale.reduce((sum, i) => sum + (i.price * i.quantity), 0),
+        items: txItems,
+        total,
         paymentMethod,
-        receiptNumber: paymentMethod === 'cash' ? number : null,
-        invoiceNumber: paymentMethod === 'credit' ? number : null,
+        receiptNumber: paymentMethod === "cash" ? number : null,
+        invoiceNumber: paymentMethod === "credit" ? number : null,
         editHistory: [],
         cancelled: false,
-        type: 'sale'
+        type: "sale",
       };
 
-      await window.storage.set(`tx:${transaction.id}`, JSON.stringify(transaction));
-      await loadData();
+      await insertTransaction(shop.id, transaction);
+      await refreshAll(shop.id);
+
       setCurrentSale([]);
-      setPaymentMethod('cash');
-      setCustomerName('');
-      alert(`${paymentMethod === 'cash' ? 'Receipt' : 'Invoice'} #${number} created!`);
+      setPaymentMethod("cash");
+      setCustomerName("");
+      alert(`${paymentMethod === "cash" ? "Receipt" : "Invoice"} #${number} created!`);
     } catch (error) {
-      console.error('Error saving transaction:', error);
-      alert('Failed to save transaction');
+      console.error("Error saving transaction:", error);
+      alert("Failed to save transaction: " + (error?.message || String(error)));
     } finally {
       setIsProcessing(false);
     }
   };
 
+  // -----------------------------
+  // Edit / Cancel Tx (Supabase)
+  // -----------------------------
   const saveEditedTransaction = async () => {
-    if (!editingTransaction) return;
+    if (!shop) return alert("Shop not ready yet");
+    if (!editingTransaction || !viewingTransaction) return;
 
     setIsProcessing(true);
-    
+
     try {
       const changes = [];
-      
-      // Check timestamp change
-      if (viewingTransaction.timestamp !== editingTransaction.timestamp) {
+      const original = viewingTransaction;
+
+      if (original.timestamp !== editingTransaction.timestamp) {
         changes.push({
-          field: 'Time',
-          from: new Date(viewingTransaction.timestamp).toLocaleString(),
-          to: new Date(editingTransaction.timestamp).toLocaleString()
+          field: "Time",
+          from: new Date(original.timestamp).toLocaleString(),
+          to: new Date(editingTransaction.timestamp).toLocaleString(),
         });
       }
-      
-      // Check customer name change
-      if (viewingTransaction.customerName !== editingTransaction.customerName) {
+
+      if ((original.customerName || "") !== (editingTransaction.customerName || "")) {
         changes.push({
-          field: 'Customer Name',
-          from: viewingTransaction.customerName || '(none)',
-          to: editingTransaction.customerName || '(none)'
+          field: "Customer Name",
+          from: original.customerName || "(none)",
+          to: editingTransaction.customerName || "(none)",
         });
       }
-      
-      // Check items changes
-      if (JSON.stringify(viewingTransaction.items) !== JSON.stringify(editingTransaction.items)) {
-        viewingTransaction.items.forEach((oldItem, idx) => {
-          const newItem = editingTransaction.items[idx];
-          if (newItem) {
-            if (oldItem.name !== newItem.name) {
-              changes.push({ field: `Item ${idx + 1} Name`, from: oldItem.name, to: newItem.name });
-            }
-            if (oldItem.price !== newItem.price) {
-              changes.push({ field: `Item ${idx + 1} Price`, from: `$${oldItem.price}`, to: `$${newItem.price}` });
-            }
-            if (oldItem.quantity !== newItem.quantity) {
-              changes.push({ field: `Item ${idx + 1} Quantity`, from: oldItem.quantity, to: newItem.quantity });
-            }
-          }
+
+      if (JSON.stringify(original.items) !== JSON.stringify(editingTransaction.items)) {
+        (original.items || []).forEach((oldItem, idx) => {
+          const newIt = (editingTransaction.items || [])[idx];
+          if (!newIt) return;
+          if (oldItem.name !== newIt.name) changes.push({ field: `Item ${idx + 1} Name`, from: oldItem.name, to: newIt.name });
+          if (oldItem.price !== newIt.price) changes.push({ field: `Item ${idx + 1} Price`, from: `$${oldItem.price}`, to: `$${newIt.price}` });
+          if (oldItem.quantity !== newIt.quantity) changes.push({ field: `Item ${idx + 1} Quantity`, from: oldItem.quantity, to: newIt.quantity });
         });
-        
-        if (editingTransaction.items.length !== viewingTransaction.items.length) {
-          changes.push({ 
-            field: 'Items Count', 
-            from: viewingTransaction.items.length, 
-            to: editingTransaction.items.length 
-          });
+
+        if ((editingTransaction.items || []).length !== (original.items || []).length) {
+          changes.push({ field: "Items Count", from: (original.items || []).length, to: (editingTransaction.items || []).length });
         }
       }
 
+      const normalizedItems = (editingTransaction.items || []).map((it) => {
+        const price = toNum(it.price, 0);
+        const qty = toNum(it.quantity, 0);
+        const subtotal = Number.isFinite(toNum(it.subtotal, NaN)) ? toNum(it.subtotal, 0) : price * qty;
+        return { ...it, price, quantity: qty, subtotal };
+      });
+
+      const newTotal = normalizedItems.reduce((sum, i) => sum + toNum(i.subtotal, 0), 0);
+
       const editRecord = {
         timestamp: new Date().toISOString(),
-        changes: changes,
-        oldTotal: viewingTransaction.total,
-        newTotal: editingTransaction.items.reduce((sum, i) => sum + i.subtotal, 0)
+        changes,
+        oldTotal: toNum(original.total, 0),
+        newTotal,
       };
 
-      editingTransaction.editHistory.push(editRecord);
-      editingTransaction.total = editingTransaction.items.reduce((sum, i) => sum + i.subtotal, 0);
+      const updated = {
+        ...editingTransaction,
+        items: normalizedItems,
+        editHistory: [...(editingTransaction.editHistory || []), editRecord],
+        total: newTotal,
+      };
 
-      await window.storage.set(`tx:${editingTransaction.id}`, JSON.stringify(editingTransaction));
-      await loadData();
+      await updateTransaction(shop.id, updated);
+      await refreshAll(shop.id);
+
       setEditingTransaction(null);
       setViewingTransaction(null);
-      alert('Transaction updated!');
+      alert("Transaction updated!");
     } catch (error) {
-      console.error('Error updating transaction:', error);
-      alert('Failed to update transaction');
+      console.error("Error updating transaction:", error);
+      alert("Failed to update transaction: " + (error?.message || String(error)));
     } finally {
       setIsProcessing(false);
     }
   };
 
   const cancelTransaction = async () => {
+    if (!shop) return alert("Shop not ready yet");
+    if (!viewingTransaction) return;
+
     setIsProcessing(true);
-    
+
     try {
       const cancelled = { ...viewingTransaction, cancelled: true };
-      
-      await window.storage.set(`tx:${cancelled.id}`, JSON.stringify(cancelled));
-      await loadData();
+      await updateTransaction(shop.id, cancelled);
+      await refreshAll(shop.id);
+
       setViewingTransaction(null);
-      alert('Transaction cancelled!');
+      alert("Transaction cancelled!");
     } catch (error) {
-      console.error('Error cancelling:', error);
-      alert('Failed to cancel transaction');
+      console.error("Error cancelling:", error);
+      alert("Failed to cancel transaction: " + (error?.message || String(error)));
     } finally {
       setIsProcessing(false);
     }
   };
 
+  // -----------------------------
+  // Date helpers (for views)
+  // -----------------------------
   const getTodayTransactions = () => {
     const today = new Date().toDateString();
-    return transactions.filter(tx => new Date(tx.timestamp).toDateString() === today);
+    return transactions.filter((tx) => new Date(tx.timestamp).toDateString() === today);
   };
 
   const getDateTransactions = (date) => {
     const dateStr = date.toDateString();
-    return transactions.filter(tx => new Date(tx.timestamp).toDateString() === dateStr);
+    return transactions.filter((tx) => new Date(tx.timestamp).toDateString() === dateStr);
   };
 
   const getCalendarDays = () => {
@@ -440,11 +519,9 @@ export default function POSApp() {
     const lastDay = new Date(year, month + 1, 0);
     const startingDayOfWeek = firstDay.getDay();
     const days = [];
-    
-    for (let i = 0; i < startingDayOfWeek; i++) {
-      days.push(null);
-    }
-    
+
+    for (let i = 0; i < startingDayOfWeek; i++) days.push(null);
+
     for (let day = 1; day <= lastDay.getDate(); day++) {
       const date = new Date(year, month, day);
       const txs = getDateTransactions(date);
@@ -452,19 +529,22 @@ export default function POSApp() {
         date,
         day,
         txCount: txs.length,
-        isToday: date.toDateString() === new Date().toDateString()
+        isToday: date.toDateString() === new Date().toDateString(),
       });
     }
-    
+
     return days;
   };
+
+  // -----------------------------
+  // MODALS / VIEWS
+  // -----------------------------
 
   // CALENDAR MODAL
   if (showCalendar) {
     const calendarDays = getCalendarDays();
-    const monthNames = ['January', 'February', 'March', 'April', 'May', 'June', 
-                        'July', 'August', 'September', 'October', 'November', 'December'];
-    
+    const monthNames = ["January","February","March","April","May","June","July","August","September","October","November","December"];
+
     return (
       <div className="min-h-screen bg-gray-900 bg-opacity-50 fixed inset-0 flex items-center justify-center p-4">
         <div className="bg-white rounded-lg shadow-xl p-6 max-w-4xl w-full">
@@ -474,7 +554,7 @@ export default function POSApp() {
               <X size={24} />
             </button>
           </div>
-          
+
           <div className="flex justify-between items-center mb-4">
             <button
               onClick={() => setCalendarMonth(new Date(calendarMonth.getFullYear(), calendarMonth.getMonth() - 1))}
@@ -492,15 +572,15 @@ export default function POSApp() {
               Next →
             </button>
           </div>
-          
+
           <div className="grid grid-cols-7 gap-2">
-            {['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map(day => (
+            {["Sun","Mon","Tue","Wed","Thu","Fri","Sat"].map((day) => (
               <div key={day} className="text-center font-bold py-2">{day}</div>
             ))}
-            
+
             {calendarDays.map((dayData, idx) => {
               if (!dayData) return <div key={`empty-${idx}`}></div>;
-              
+
               return (
                 <button
                   key={idx}
@@ -512,18 +592,12 @@ export default function POSApp() {
                     }
                   }}
                   disabled={dayData.txCount === 0}
-                  className={`aspect-square p-2 rounded ${
-                    dayData.isToday ? 'ring-2 ring-indigo-500' : ''
-                  } ${
-                    dayData.txCount > 0
-                      ? 'bg-indigo-50 hover:bg-indigo-100 cursor-pointer'
-                      : 'bg-gray-100 cursor-not-allowed opacity-50'
+                  className={`aspect-square p-2 rounded ${dayData.isToday ? "ring-2 ring-indigo-500" : ""} ${
+                    dayData.txCount > 0 ? "bg-indigo-50 hover:bg-indigo-100 cursor-pointer" : "bg-gray-100 cursor-not-allowed opacity-50"
                   }`}
                 >
                   <div className="font-bold">{dayData.day}</div>
-                  {dayData.txCount > 0 && (
-                    <div className="text-xs text-indigo-600">{dayData.txCount} tx</div>
-                  )}
+                  {dayData.txCount > 0 && <div className="text-xs text-indigo-600">{dayData.txCount} tx</div>}
                 </button>
               );
             })}
@@ -536,7 +610,7 @@ export default function POSApp() {
   // RECEIPT MODAL
   if (showReceipt && viewingTransaction) {
     const tx = viewingTransaction;
-    
+
     return (
       <div className="min-h-screen bg-gray-900 bg-opacity-50 fixed inset-0 flex items-center justify-center p-4">
         <div className="bg-white rounded-lg shadow-xl p-8 max-w-md w-full">
@@ -546,33 +620,27 @@ export default function POSApp() {
               <X size={24} />
             </button>
           </div>
-          
+
           <div className="border-b-2 border-dashed pb-4 mb-4">
             <p className="text-center text-gray-600 text-sm">Thank you for your purchase!</p>
-            {tx.receiptNumber && (
-              <p className="text-center font-bold text-lg mt-2">Receipt #: {tx.receiptNumber}</p>
-            )}
-            <p className="text-center text-xs text-gray-500 mt-2">
-              {new Date(tx.timestamp).toLocaleString()}
-            </p>
-            {tx.customerName && (
-              <p className="text-center font-semibold mt-2">Customer: {tx.customerName}</p>
-            )}
+            {tx.receiptNumber && <p className="text-center font-bold text-lg mt-2">Receipt #: {tx.receiptNumber}</p>}
+            <p className="text-center text-xs text-gray-500 mt-2">{new Date(tx.timestamp).toLocaleString()}</p>
+            {tx.customerName && <p className="text-center font-semibold mt-2">Customer: {tx.customerName}</p>}
           </div>
-          
+
           <div className="space-y-2 mb-6">
-            {tx.items.map((item, idx) => (
+            {(tx.items || []).map((item, idx) => (
               <div key={idx} className="flex justify-between text-sm">
-                <span>{item.name} x{item.quantity}</span>
-                <span className="font-semibold">${item.subtotal.toFixed(2)}</span>
+                <span>{item.name} x{toNum(item.quantity, 0)}</span>
+                <span className="font-semibold">${money(item.subtotal)}</span>
               </div>
             ))}
           </div>
-          
+
           <div className="border-t-2 pt-4">
             <div className="flex justify-between text-2xl font-bold">
               <span>Total:</span>
-              <span className="text-indigo-600">${tx.total.toFixed(2)}</span>
+              <span className="text-indigo-600">${money(tx.total)}</span>
             </div>
           </div>
         </div>
@@ -583,7 +651,7 @@ export default function POSApp() {
   // INVOICE MODAL
   if (showInvoice && viewingTransaction) {
     const tx = viewingTransaction;
-    
+
     return (
       <div className="min-h-screen bg-gray-900 bg-opacity-50 fixed inset-0 flex items-center justify-center p-4">
         <div className="bg-white rounded-lg shadow-xl p-8 max-w-md w-full">
@@ -593,33 +661,27 @@ export default function POSApp() {
               <X size={24} />
             </button>
           </div>
-          
+
           <div className="border-b-2 border-dashed pb-4 mb-4">
             <p className="text-center text-gray-600 text-sm">Payment Due</p>
-            {tx.invoiceNumber && (
-              <p className="text-center font-bold text-lg mt-2">Invoice #: {tx.invoiceNumber}</p>
-            )}
-            <p className="text-center text-xs text-gray-500 mt-2">
-              {new Date(tx.timestamp).toLocaleString()}
-            </p>
-            {tx.customerName && (
-              <p className="text-center font-semibold mt-2 text-lg">Customer: {tx.customerName}</p>
-            )}
+            {tx.invoiceNumber && <p className="text-center font-bold text-lg mt-2">Invoice #: {tx.invoiceNumber}</p>}
+            <p className="text-center text-xs text-gray-500 mt-2">{new Date(tx.timestamp).toLocaleString()}</p>
+            {tx.customerName && <p className="text-center font-semibold mt-2 text-lg">Customer: {tx.customerName}</p>}
           </div>
-          
+
           <div className="space-y-2 mb-6">
-            {tx.items.map((item, idx) => (
+            {(tx.items || []).map((item, idx) => (
               <div key={idx} className="flex justify-between text-sm">
-                <span>{item.name} x{item.quantity}</span>
-                <span className="font-semibold">${item.subtotal.toFixed(2)}</span>
+                <span>{item.name} x{toNum(item.quantity, 0)}</span>
+                <span className="font-semibold">${money(item.subtotal)}</span>
               </div>
             ))}
           </div>
-          
+
           <div className="border-t-2 pt-4">
             <div className="flex justify-between text-2xl font-bold">
               <span>Amount Due:</span>
-              <span className="text-orange-600">${tx.total.toFixed(2)}</span>
+              <span className="text-orange-600">${money(tx.total)}</span>
             </div>
           </div>
         </div>
@@ -630,7 +692,7 @@ export default function POSApp() {
   // TRANSACTION MODAL
   if (viewingTransaction && !editingTransaction) {
     const tx = viewingTransaction;
-    
+
     return (
       <div className="min-h-screen bg-gray-900 bg-opacity-50 fixed inset-0 flex items-center justify-center p-4">
         <div className="bg-white rounded-lg shadow-xl p-6 max-w-2xl w-full max-h-[90vh] overflow-y-auto">
@@ -640,53 +702,58 @@ export default function POSApp() {
               <X size={24} />
             </button>
           </div>
-          
+
           <div className="mb-4">
-            <p className="text-sm text-gray-600">
-              {new Date(tx.timestamp).toLocaleString()}
-            </p>
-            {tx.customerName && (
-              <p className="font-semibold mt-1">Customer: {tx.customerName}</p>
-            )}
+            <p className="text-sm text-gray-600">{new Date(tx.timestamp).toLocaleString()}</p>
+            {tx.customerName && <p className="font-semibold mt-1">Customer: {tx.customerName}</p>}
             <div className="flex gap-2 mt-2">
-              <span className={`px-2 py-1 rounded text-xs font-semibold ${
-                tx.paymentMethod === 'cash' ? 'bg-green-100 text-green-800' : 'bg-orange-100 text-orange-800'
-              }`}>
-                {tx.paymentMethod.toUpperCase()}
+              <span
+                className={`px-2 py-1 rounded text-xs font-semibold ${
+                  tx.paymentMethod === "cash" ? "bg-green-100 text-green-800" : "bg-orange-100 text-orange-800"
+                }`}
+              >
+                {(tx.paymentMethod || "").toUpperCase()}
               </span>
-              {(tx.type === 'cash-in' || tx.type === 'cash-out') && (
-                <span className={`px-2 py-1 rounded text-xs font-semibold text-white ${tx.type === 'cash-out' ? 'bg-red-600' : 'bg-emerald-600'}`}>
-                  {tx.type === 'cash-out' ? 'CASH OUT' : 'CASH IN'}
+
+              {(tx.type === "cash-in" || tx.type === "cash-out") && (
+                <span
+                  className={`px-2 py-1 rounded text-xs font-semibold text-white ${
+                    tx.type === "cash-out" ? "bg-red-600" : "bg-emerald-600"
+                  }`}
+                >
+                  {tx.type === "cash-out" ? "CASH OUT" : "CASH IN"}
                 </span>
               )}
+
               {tx.cancelled && (
-                <span className="px-2 py-1 rounded text-xs font-semibold bg-red-100 text-red-800">
-                  CANCELLED
-                </span>
+                <span className="px-2 py-1 rounded text-xs font-semibold bg-red-100 text-red-800">CANCELLED</span>
               )}
-              {tx.editHistory.length > 0 && (
+
+              {(tx.editHistory || []).length > 0 && (
                 <span className="px-2 py-1 rounded text-xs font-semibold bg-yellow-100 text-yellow-800">
                   ✏️ EDITED ({tx.editHistory.length})
                 </span>
               )}
             </div>
           </div>
-          
+
           <div className="mb-4">
             <h3 className="font-semibold mb-2">Items:</h3>
-            {tx.items.map((item, idx) => (
-              <div key={idx} className={`flex justify-between py-2 border-b ${tx.cancelled ? 'line-through opacity-60' : ''}`}>
-                <span>{item.name} x{item.quantity} @ ${item.price.toFixed(2)}</span>
-                <span className="font-semibold">${item.subtotal.toFixed(2)}</span>
+            {(tx.items || []).map((item, idx) => (
+              <div key={idx} className={`flex justify-between py-2 border-b ${tx.cancelled ? "line-through opacity-60" : ""}`}>
+                <span>
+                  {item.name} x{toNum(item.quantity, 0)} @ ${money(item.price)}
+                </span>
+                <span className="font-semibold">${money(item.subtotal)}</span>
               </div>
             ))}
             <div className="flex justify-between py-2 font-bold text-lg">
               <span>Total:</span>
-              <span className="text-indigo-600">${tx.total.toFixed(2)}</span>
+              <span className="text-indigo-600">${money(tx.total)}</span>
             </div>
           </div>
-          
-          {tx.editHistory.length > 0 && (
+
+          {(tx.editHistory || []).length > 0 && (
             <div className="mb-4 p-3 bg-gray-50 rounded">
               <h3 className="font-semibold mb-2">Edit History:</h3>
               {tx.editHistory.map((edit, idx) => (
@@ -695,17 +762,17 @@ export default function POSApp() {
                     Edit #{idx + 1} - {new Date(edit.timestamp).toLocaleString()}
                   </div>
                   <div className="ml-4 mt-1 space-y-1">
-                    {edit.changes && edit.changes.map((change, cIdx) => (
-                      <div key={cIdx} className="text-gray-700">
-                        <span className="font-medium">{change.field}:</span>{' '}
-                        <span className="line-through text-red-600">{change.from}</span>
-                        {' → '}
-                        <span className="text-green-600">{change.to}</span>
-                      </div>
-                    ))}
+                    {edit.changes &&
+                      edit.changes.map((change, cIdx) => (
+                        <div key={cIdx} className="text-gray-700">
+                          <span className="font-medium">{change.field}:</span>{" "}
+                          <span className="line-through text-red-600">{change.from}</span> {" → "}
+                          <span className="text-green-600">{change.to}</span>
+                        </div>
+                      ))}
                     {edit.oldTotal !== edit.newTotal && (
                       <div className="font-medium text-gray-700">
-                        Total: ${edit.oldTotal.toFixed(2)} → ${edit.newTotal.toFixed(2)}
+                        Total: ${money(edit.oldTotal)} → ${money(edit.newTotal)}
                       </div>
                     )}
                   </div>
@@ -713,21 +780,15 @@ export default function POSApp() {
               ))}
             </div>
           )}
-          
+
           <div className="grid grid-cols-2 gap-2 mb-2">
-            {tx.paymentMethod === 'cash' && (
-              <button
-                onClick={() => setShowReceipt(true)}
-                className="bg-green-600 text-white py-2 rounded hover:bg-green-700"
-              >
+            {tx.paymentMethod === "cash" && (
+              <button onClick={() => setShowReceipt(true)} className="bg-green-600 text-white py-2 rounded hover:bg-green-700">
                 📄 View Receipt
               </button>
             )}
-            {tx.paymentMethod === 'credit' && (
-              <button
-                onClick={() => setShowInvoice(true)}
-                className="bg-orange-600 text-white py-2 rounded hover:bg-orange-700"
-              >
+            {tx.paymentMethod === "credit" && (
+              <button onClick={() => setShowInvoice(true)} className="bg-orange-600 text-white py-2 rounded hover:bg-orange-700">
                 📋 View Invoice
               </button>
             )}
@@ -738,15 +799,13 @@ export default function POSApp() {
               <Edit2 size={18} /> Edit
             </button>
           </div>
-          
+
           {!tx.cancelled && (
             <button
               onClick={cancelTransaction}
               disabled={isProcessing}
               className={`w-full py-2 rounded flex items-center justify-center gap-2 ${
-                isProcessing
-                  ? 'bg-gray-400 text-white cursor-not-allowed'
-                  : 'bg-red-600 text-white hover:bg-red-700'
+                isProcessing ? "bg-gray-400 text-white cursor-not-allowed" : "bg-red-600 text-white hover:bg-red-700"
               }`}
             >
               {isProcessing ? (
@@ -755,7 +814,7 @@ export default function POSApp() {
                   Cancelling...
                 </>
               ) : (
-                'Cancel Transaction'
+                "Cancel Transaction"
               )}
             </button>
           )}
@@ -775,43 +834,42 @@ export default function POSApp() {
               <X size={24} />
             </button>
           </div>
-          
+
           <div className="mb-4">
             <label className="block text-sm font-medium mb-1">Time</label>
             <input
               type="datetime-local"
               value={new Date(editingTransaction.timestamp).toISOString().slice(0, 16)}
-              onChange={(e) => setEditingTransaction({
-                ...editingTransaction,
-                timestamp: new Date(e.target.value).toISOString()
-              })}
+              onChange={(e) =>
+                setEditingTransaction({
+                  ...editingTransaction,
+                  timestamp: new Date(e.target.value).toISOString(),
+                })
+              }
               className="w-full px-3 py-2 border rounded"
             />
           </div>
-          
+
           <div className="mb-4">
             <label className="block text-sm font-medium mb-1">Customer Name</label>
             <input
               type="text"
-              value={editingTransaction.customerName || ''}
-              onChange={(e) => setEditingTransaction({
-                ...editingTransaction,
-                customerName: e.target.value
-              })}
+              value={editingTransaction.customerName || ""}
+              onChange={(e) => setEditingTransaction({ ...editingTransaction, customerName: e.target.value })}
               className="w-full px-3 py-2 border rounded"
               placeholder="Customer name (optional)"
             />
           </div>
-          
+
           <h3 className="font-semibold mb-2">Items:</h3>
-          {editingTransaction.items.map((item, idx) => (
+          {(editingTransaction.items || []).map((item, idx) => (
             <div key={idx} className="grid grid-cols-12 gap-2 mb-2">
               <input
                 type="text"
                 value={item.name}
                 onChange={(e) => {
-                  const newItems = [...editingTransaction.items];
-                  newItems[idx].name = e.target.value;
+                  const newItems = [...(editingTransaction.items || [])];
+                  newItems[idx] = { ...newItems[idx], name: e.target.value };
                   setEditingTransaction({ ...editingTransaction, items: newItems });
                 }}
                 className="col-span-5 px-2 py-1 border rounded"
@@ -822,9 +880,10 @@ export default function POSApp() {
                 step="0.01"
                 value={item.price}
                 onChange={(e) => {
-                  const newItems = [...editingTransaction.items];
-                  newItems[idx].price = parseFloat(e.target.value) || 0;
-                  newItems[idx].subtotal = newItems[idx].price * newItems[idx].quantity;
+                  const newItems = [...(editingTransaction.items || [])];
+                  const price = toNum(e.target.value, 0);
+                  const qty = toNum(newItems[idx].quantity, 0);
+                  newItems[idx] = { ...newItems[idx], price, subtotal: price * qty };
                   setEditingTransaction({ ...editingTransaction, items: newItems });
                 }}
                 className="col-span-2 px-2 py-1 border rounded"
@@ -834,20 +893,19 @@ export default function POSApp() {
                 type="number"
                 value={item.quantity}
                 onChange={(e) => {
-                  const newItems = [...editingTransaction.items];
-                  newItems[idx].quantity = clampInt(e.target.value, 1, 1);
-                  newItems[idx].subtotal = newItems[idx].price * newItems[idx].quantity;
+                  const newItems = [...(editingTransaction.items || [])];
+                  const qty = clampInt(e.target.value, 1, 1);
+                  const price = toNum(newItems[idx].price, 0);
+                  newItems[idx] = { ...newItems[idx], quantity: qty, subtotal: price * qty };
                   setEditingTransaction({ ...editingTransaction, items: newItems });
                 }}
                 className="col-span-2 px-2 py-1 border rounded"
                 placeholder="Qty"
               />
-              <div className="col-span-2 px-2 py-1 text-sm font-semibold">
-                ${item.subtotal.toFixed(2)}
-              </div>
+              <div className="col-span-2 px-2 py-1 text-sm font-semibold">${money(item.subtotal)}</div>
               <button
                 onClick={() => {
-                  const newItems = editingTransaction.items.filter((_, i) => i !== idx);
+                  const newItems = (editingTransaction.items || []).filter((_, i) => i !== idx);
                   setEditingTransaction({ ...editingTransaction, items: newItems });
                 }}
                 className="col-span-1 text-red-500 hover:text-red-700"
@@ -856,23 +914,21 @@ export default function POSApp() {
               </button>
             </div>
           ))}
-          
+
           <div className="mt-4 pt-4 border-t">
             <div className="flex justify-between text-lg font-bold mb-4">
               <span>Total:</span>
               <span className="text-indigo-600">
-                ${editingTransaction.items.reduce((sum, i) => sum + i.subtotal, 0).toFixed(2)}
+                ${money((editingTransaction.items || []).reduce((sum, i) => sum + toNum(i.subtotal, 0), 0))}
               </span>
             </div>
-            
+
             <div className="flex gap-2">
               <button
                 onClick={saveEditedTransaction}
                 disabled={isProcessing}
                 className={`flex-1 py-2 rounded flex items-center justify-center gap-2 ${
-                  isProcessing
-                    ? 'bg-gray-400 text-white cursor-not-allowed'
-                    : 'bg-green-600 text-white hover:bg-green-700'
+                  isProcessing ? "bg-gray-400 text-white cursor-not-allowed" : "bg-green-600 text-white hover:bg-green-700"
                 }`}
               >
                 {isProcessing ? (
@@ -890,9 +946,7 @@ export default function POSApp() {
                 onClick={() => setEditingTransaction(null)}
                 disabled={isProcessing}
                 className={`flex-1 py-2 rounded ${
-                  isProcessing
-                    ? 'bg-gray-200 text-gray-400 cursor-not-allowed'
-                    : 'bg-gray-300 text-gray-800 hover:bg-gray-400'
+                  isProcessing ? "bg-gray-200 text-gray-400 cursor-not-allowed" : "bg-gray-300 text-gray-800 hover:bg-gray-400"
                 }`}
               >
                 Cancel
@@ -915,7 +969,7 @@ export default function POSApp() {
               <X size={24} />
             </button>
           </div>
-          
+
           <div className="space-y-4">
             <div>
               <label className="block text-sm font-medium mb-1">Item Name</label>
@@ -927,7 +981,7 @@ export default function POSApp() {
                 className="w-full px-3 py-2 border rounded"
               />
             </div>
-            
+
             <div>
               <label className="block text-sm font-medium mb-1">Unit Price</label>
               <input
@@ -939,7 +993,7 @@ export default function POSApp() {
                 className="w-full px-3 py-2 border rounded"
               />
             </div>
-            
+
             <div>
               <label className="block text-sm font-medium mb-1">Quantity</label>
               <input
@@ -951,18 +1005,15 @@ export default function POSApp() {
                 className="w-full px-3 py-2 border rounded"
               />
             </div>
-            
+
             <div className="flex gap-2">
-              <button
-                onClick={addQuickItemToSale}
-                className="flex-1 bg-indigo-600 text-white py-2 rounded hover:bg-indigo-700"
-              >
+              <button onClick={addQuickItemToSale} className="flex-1 bg-indigo-600 text-white py-2 rounded hover:bg-indigo-700">
                 Add to Sale
               </button>
               <button
                 onClick={() => {
                   setShowQuickItem(false);
-                  setQuickItem({ name: '', price: '', quantity: 1 });
+                  setQuickItem({ name: "", price: "", quantity: 1 });
                 }}
                 className="flex-1 bg-gray-300 text-gray-800 py-2 rounded hover:bg-gray-400"
               >
@@ -986,34 +1037,30 @@ export default function POSApp() {
               <X size={24} />
             </button>
           </div>
-          
+
           <div className="space-y-4">
             <div>
               <label className="block text-sm font-medium mb-2">Transaction Type</label>
               <div className="flex gap-2">
                 <button
-                  onClick={() => setCashTransaction({ ...cashTransaction, type: 'out' })}
+                  onClick={() => setCashTransaction({ ...cashTransaction, type: "out" })}
                   className={`flex-1 py-3 rounded font-semibold ${
-                    cashTransaction.type === 'out' 
-                      ? 'bg-red-600 text-white' 
-                      : 'bg-gray-200 text-gray-800'
+                    cashTransaction.type === "out" ? "bg-red-600 text-white" : "bg-gray-200 text-gray-800"
                   }`}
                 >
                   Cash Out
                 </button>
                 <button
-                  onClick={() => setCashTransaction({ ...cashTransaction, type: 'in' })}
+                  onClick={() => setCashTransaction({ ...cashTransaction, type: "in" })}
                   className={`flex-1 py-3 rounded font-semibold ${
-                    cashTransaction.type === 'in' 
-                      ? 'bg-green-600 text-white' 
-                      : 'bg-gray-200 text-gray-800'
+                    cashTransaction.type === "in" ? "bg-green-600 text-white" : "bg-gray-200 text-gray-800"
                   }`}
                 >
                   Cash In
                 </button>
               </div>
             </div>
-            
+
             <div>
               <label className="block text-sm font-medium mb-1">Reason</label>
               <input
@@ -1024,7 +1071,7 @@ export default function POSApp() {
                 className="w-full px-3 py-2 border rounded"
               />
             </div>
-            
+
             <div>
               <label className="block text-sm font-medium mb-1">Amount</label>
               <input
@@ -1036,17 +1083,17 @@ export default function POSApp() {
                 className="w-full px-3 py-2 border rounded"
               />
             </div>
-            
+
             <div className="flex gap-2">
               <button
                 onClick={recordCashTransaction}
                 disabled={isProcessing}
                 className={`flex-1 text-white py-3 rounded font-semibold flex items-center justify-center gap-2 ${
                   isProcessing
-                    ? 'bg-gray-400 cursor-not-allowed'
-                    : cashTransaction.type === 'out'
-                      ? 'bg-red-600 hover:bg-red-700'
-                      : 'bg-green-600 hover:bg-green-700'
+                    ? "bg-gray-400 cursor-not-allowed"
+                    : cashTransaction.type === "out"
+                    ? "bg-red-600 hover:bg-red-700"
+                    : "bg-green-600 hover:bg-green-700"
                 }`}
               >
                 {isProcessing ? (
@@ -1055,13 +1102,13 @@ export default function POSApp() {
                     Processing...
                   </>
                 ) : (
-                  `Record Cash ${cashTransaction.type === 'out' ? 'Out' : 'In'}`
+                  `Record Cash ${cashTransaction.type === "out" ? "Out" : "In"}`
                 )}
               </button>
               <button
                 onClick={() => {
                   setShowCashModal(false);
-                  setCashTransaction({ type: 'out', reason: '', amount: '' });
+                  setCashTransaction({ type: "out", reason: "", amount: "" });
                 }}
                 className="flex-1 bg-gray-300 text-gray-800 py-3 rounded hover:bg-gray-400 font-semibold"
               >
@@ -1078,32 +1125,28 @@ export default function POSApp() {
   if (showSettings) {
     return (
       <div className="min-h-screen bg-gray-900 bg-opacity-50 fixed inset-0 flex items-center justify-center p-4 z-50">
-        <div className={`rounded-lg shadow-xl p-6 max-w-md w-full ${darkMode ? 'bg-gray-800' : 'bg-white'}`}>
+        <div className={`rounded-lg shadow-xl p-6 max-w-md w-full ${darkMode ? "bg-gray-800" : "bg-white"}`}>
           <div className="flex justify-between items-center mb-6">
-            <h2 className={`text-2xl font-bold ${darkMode ? 'text-indigo-400' : 'text-indigo-600'}`}>Settings</h2>
-            <button onClick={() => setShowSettings(false)} className={`p-2 rounded ${darkMode ? 'hover:bg-gray-700' : 'hover:bg-gray-100'}`}>
-              <X size={24} className={darkMode ? 'text-white' : 'text-black'} />
+            <h2 className={`text-2xl font-bold ${darkMode ? "text-indigo-400" : "text-indigo-600"}`}>Settings</h2>
+            <button onClick={() => setShowSettings(false)} className={`p-2 rounded ${darkMode ? "hover:bg-gray-700" : "hover:bg-gray-100"}`}>
+              <X size={24} className={darkMode ? "text-white" : "text-black"} />
             </button>
           </div>
-          
+
           <div className="space-y-4">
-            <div className={`p-4 rounded-lg ${darkMode ? 'bg-gray-700' : 'bg-gray-50'}`}>
+            <div className={`p-4 rounded-lg ${darkMode ? "bg-gray-700" : "bg-gray-50"}`}>
               <div className="flex justify-between items-center">
                 <div>
-                  <h3 className={`font-semibold ${darkMode ? 'text-white' : 'text-gray-900'}`}>Theme</h3>
-                  <p className={`text-sm ${darkMode ? 'text-gray-400' : 'text-gray-600'}`}>
-                    {darkMode ? 'Dark Mode' : 'Light Mode'}
-                  </p>
+                  <h3 className={`font-semibold ${darkMode ? "text-white" : "text-gray-900"}`}>Theme</h3>
+                  <p className={`text-sm ${darkMode ? "text-gray-400" : "text-gray-600"}`}>{darkMode ? "Dark Mode" : "Light Mode"}</p>
                 </div>
                 <button
                   onClick={() => setDarkMode(!darkMode)}
-                  className={`relative inline-flex h-12 w-24 items-center rounded-full transition-colors ${
-                    darkMode ? 'bg-indigo-600' : 'bg-gray-300'
-                  }`}
+                  className={`relative inline-flex h-12 w-24 items-center rounded-full transition-colors ${darkMode ? "bg-indigo-600" : "bg-gray-300"}`}
                 >
                   <span
                     className={`inline-block h-10 w-10 transform rounded-full bg-white shadow-lg transition-transform flex items-center justify-center ${
-                      darkMode ? 'translate-x-12' : 'translate-x-1'
+                      darkMode ? "translate-x-12" : "translate-x-1"
                     }`}
                   >
                     {darkMode ? <Moon size={20} className="text-indigo-600" /> : <Sun size={20} className="text-yellow-500" />}
@@ -1128,7 +1171,7 @@ export default function POSApp() {
               <X size={24} />
             </button>
           </div>
-          
+
           <div className="mb-6 p-4 bg-gray-50 rounded">
             <h3 className="font-semibold mb-3">Add New Item</h3>
             <div className="grid grid-cols-3 gap-2">
@@ -1155,22 +1198,19 @@ export default function POSApp() {
                 className="px-3 py-2 border rounded"
               />
             </div>
-            <button
-              onClick={addItem}
-              className="mt-2 w-full bg-indigo-600 text-white py-2 rounded hover:bg-indigo-700"
-            >
+            <button onClick={addItem} className="mt-2 w-full bg-indigo-600 text-white py-2 rounded hover:bg-indigo-700">
               Add Item
             </button>
           </div>
-          
+
           <h3 className="font-semibold mb-3">Current Items</h3>
           <div className="space-y-2">
-            {items.map(item => (
+            {items.map((item) => (
               <div key={item.id} className="flex justify-between items-center p-3 bg-gray-50 rounded">
                 <div>
                   <div className="font-medium">{item.name}</div>
                   <div className="text-sm text-gray-600">
-                    ${item.price.toFixed(2)} • {item.category}
+                    ${money(item.price)} • {item.category}
                   </div>
                 </div>
                 <button
@@ -1192,27 +1232,16 @@ export default function POSApp() {
 
   // RECEIPTS VIEW
   if (showReceiptsView) {
-    const receipts = transactions.filter(tx => tx.paymentMethod === 'cash');
+    const receipts = transactions.filter((tx) => tx.paymentMethod === "cash");
     const receiptItems = [];
-    
-    receipts.forEach(tx => {
-      tx.items.forEach(item => {
-        receiptItems.push({
-          tx: tx,
-          item: item
-        });
-      });
-    });
-    
+    receipts.forEach((tx) => (tx.items || []).forEach((item) => receiptItems.push({ tx, item })));
+
     return (
       <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 p-4">
         <div className="max-w-7xl mx-auto">
           <div className="flex justify-between items-center mb-6">
             <h1 className="text-4xl font-bold text-indigo-600">All Receipts</h1>
-            <button
-              onClick={() => setShowReceiptsView(false)}
-              className="px-4 py-2 bg-white rounded-lg shadow hover:shadow-md"
-            >
+            <button onClick={() => setShowReceiptsView(false)} className="px-4 py-2 bg-white rounded-lg shadow hover:shadow-md">
               ← Back to POS
             </button>
           </div>
@@ -1231,23 +1260,17 @@ export default function POSApp() {
                 </thead>
                 <tbody>
                   {receiptItems.map((row, idx) => (
-                    <tr 
-                      key={idx}
-                      onClick={() => setViewingTransaction(row.tx)}
-                      className="border-b cursor-pointer hover:bg-indigo-50"
-                    >
-                      <td className="py-2 px-2 font-semibold">{row.tx.receiptNumber}</td>
-                      <td className="py-2 px-2">{row.tx.customerName || '-'}</td>
+                    <tr key={idx} onClick={() => setViewingTransaction(row.tx)} className="border-b cursor-pointer hover:bg-indigo-50">
+                      <td className="py-2 px-2 font-semibold">{row.tx.receiptNumber || "-"}</td>
+                      <td className="py-2 px-2">{row.tx.customerName || "-"}</td>
                       <td className="py-2 px-2">{row.item.name}</td>
-                      <td className="py-2 px-2 text-right">{row.item.quantity}</td>
-                      <td className="py-2 px-2 text-right font-semibold">${row.item.subtotal.toFixed(2)}</td>
+                      <td className="py-2 px-2 text-right">{toNum(row.item.quantity, 0)}</td>
+                      <td className="py-2 px-2 text-right font-semibold">${money(row.item.subtotal)}</td>
                     </tr>
                   ))}
                 </tbody>
               </table>
-              {receiptItems.length === 0 && (
-                <p className="text-gray-500 text-center py-8">No receipts yet</p>
-              )}
+              {receiptItems.length === 0 && <p className="text-gray-500 text-center py-8">No receipts yet</p>}
             </div>
           </div>
         </div>
@@ -1257,27 +1280,16 @@ export default function POSApp() {
 
   // INVOICES VIEW
   if (showInvoicesView) {
-    const invoices = transactions.filter(tx => tx.paymentMethod === 'credit');
+    const invoices = transactions.filter((tx) => tx.paymentMethod === "credit");
     const invoiceItems = [];
-    
-    invoices.forEach(tx => {
-      tx.items.forEach(item => {
-        invoiceItems.push({
-          tx: tx,
-          item: item
-        });
-      });
-    });
-    
+    invoices.forEach((tx) => (tx.items || []).forEach((item) => invoiceItems.push({ tx, item })));
+
     return (
       <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 p-4">
         <div className="max-w-7xl mx-auto">
           <div className="flex justify-between items-center mb-6">
             <h1 className="text-4xl font-bold text-orange-600">All Invoices</h1>
-            <button
-              onClick={() => setShowInvoicesView(false)}
-              className="px-4 py-2 bg-white rounded-lg shadow hover:shadow-md"
-            >
+            <button onClick={() => setShowInvoicesView(false)} className="px-4 py-2 bg-white rounded-lg shadow hover:shadow-md">
               ← Back to POS
             </button>
           </div>
@@ -1296,23 +1308,17 @@ export default function POSApp() {
                 </thead>
                 <tbody>
                   {invoiceItems.map((row, idx) => (
-                    <tr 
-                      key={idx}
-                      onClick={() => setViewingTransaction(row.tx)}
-                      className="border-b cursor-pointer hover:bg-orange-50"
-                    >
-                      <td className="py-2 px-2 font-semibold">{row.tx.invoiceNumber}</td>
-                      <td className="py-2 px-2">{row.tx.customerName || '-'}</td>
+                    <tr key={idx} onClick={() => setViewingTransaction(row.tx)} className="border-b cursor-pointer hover:bg-orange-50">
+                      <td className="py-2 px-2 font-semibold">{row.tx.invoiceNumber || "-"}</td>
+                      <td className="py-2 px-2">{row.tx.customerName || "-"}</td>
                       <td className="py-2 px-2">{row.item.name}</td>
-                      <td className="py-2 px-2 text-right">{row.item.quantity}</td>
-                      <td className="py-2 px-2 text-right font-semibold">${row.item.subtotal.toFixed(2)}</td>
+                      <td className="py-2 px-2 text-right">{toNum(row.item.quantity, 0)}</td>
+                      <td className="py-2 px-2 text-right font-semibold">${money(row.item.subtotal)}</td>
                     </tr>
                   ))}
                 </tbody>
               </table>
-              {invoiceItems.length === 0 && (
-                <p className="text-gray-500 text-center py-8">No invoices yet</p>
-              )}
+              {invoiceItems.length === 0 && <p className="text-gray-500 text-center py-8">No invoices yet</p>}
             </div>
           </div>
         </div>
@@ -1320,12 +1326,18 @@ export default function POSApp() {
     );
   }
 
-  // MAIN APP
+  // TRANSACTIONS TABLE VIEW
   if (showTransactions) {
     const displayTxs = selectedDate ? getDateTransactions(selectedDate) : getTodayTransactions();
     const { sortedTxs, rows: dailyRows } = computeDailySummary(displayTxs);
-    const cashSales = displayTxs.filter(tx => !tx.cancelled && tx.paymentMethod === 'cash').reduce((sum, tx) => sum + tx.total, 0);
-    const creditSales = displayTxs.filter(tx => !tx.cancelled && tx.paymentMethod === 'credit').reduce((sum, tx) => sum + tx.total, 0);
+
+    const cashSales = displayTxs
+      .filter((tx) => !tx.cancelled && tx.paymentMethod === "cash")
+      .reduce((sum, tx) => sum + toNum(tx.total, 0), 0);
+
+    const creditSales = displayTxs
+      .filter((tx) => !tx.cancelled && tx.paymentMethod === "credit")
+      .reduce((sum, tx) => sum + toNum(tx.total, 0), 0);
 
     return (
       <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 p-4">
@@ -1346,32 +1358,28 @@ export default function POSApp() {
           <div className="bg-white rounded-lg shadow-xl p-6">
             <div className="flex justify-between items-center mb-4">
               <h2 className="text-2xl font-semibold">
-                {selectedDate 
-                  ? selectedDate.toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })
-                  : "Today's Transactions"
-                }
+                {selectedDate
+                  ? selectedDate.toLocaleDateString("en-US", { weekday: "long", year: "numeric", month: "long", day: "numeric" })
+                  : "Today's Transactions"}
               </h2>
               {selectedDate && (
-                <button
-                  onClick={() => setSelectedDate(null)}
-                  className="text-sm text-indigo-600 hover:text-indigo-800"
-                >
+                <button onClick={() => setSelectedDate(null)} className="text-sm text-indigo-600 hover:text-indigo-800">
                   View Today
                 </button>
               )}
             </div>
-            
+
             <div className="grid grid-cols-2 gap-4 mb-4 p-4 bg-indigo-50 rounded">
               <div>
                 <div className="text-sm text-gray-600">Total Cash Sales</div>
-                <div className="text-2xl font-bold text-blue-600">${cashSales.toFixed(2)}</div>
+                <div className="text-2xl font-bold text-blue-600">${money(cashSales)}</div>
               </div>
               <div>
                 <div className="text-sm text-gray-600">Total Credit Sales</div>
-                <div className="text-2xl font-bold text-orange-600">${creditSales.toFixed(2)}</div>
+                <div className="text-2xl font-bold text-orange-600">${money(creditSales)}</div>
               </div>
             </div>
-            
+
             <div className="overflow-x-auto">
               <table className="w-full text-sm">
                 <thead>
@@ -1385,54 +1393,54 @@ export default function POSApp() {
                 </thead>
                 <tbody>
                   {dailyRows.map((row, idx) => {
-                    const tx = sortedTxs.find(t => t.id === row.txId);
-                    
+                    const tx = sortedTxs.find((t) => t.id === row.txId);
+
                     return (
-                      <tr 
+                      <tr
                         key={idx}
-                        onClick={() => setViewingTransaction(tx)}
+                        onClick={() => tx && setViewingTransaction(tx)}
                         className={`border-b cursor-pointer hover:bg-indigo-50 ${
                           row.cancelled
-                            ? 'bg-red-50'
-                            : row.type === 'cash-in' || row.type === 'cash-out'
-                              ? 'bg-emerald-50'
-                              : row.paymentMethod === 'credit'
-                                ? 'bg-orange-50'
-                                : ''
+                            ? "bg-red-50"
+                            : row.type === "cash-in" || row.type === "cash-out"
+                            ? "bg-emerald-50"
+                            : row.paymentMethod === "credit"
+                            ? "bg-orange-50"
+                            : ""
                         }`}
                       >
                         {row.itemIndex === 0 ? (
-                          <td className="py-2 px-2" rowSpan={row.totalItems}>
+                          <td className="py-2 px-2" rowSpan={Math.max(1, row.totalItems)}>
                             {new Date(row.timestamp).toLocaleTimeString()}
                           </td>
                         ) : null}
-                        <td className={`py-2 px-2 ${row.cancelled ? 'line-through' : ''}`}>
+
+                        <td className={`py-2 px-2 ${row.cancelled ? "line-through" : ""}`}>
                           {row.item.name}
                           {row.edited && <span className="text-orange-600"> *</span>}
                           {row.cancelled && <span className="ml-2 text-xs px-1 py-0.5 bg-red-500 text-white rounded">CANCELLED</span>}
-                          {(row.type === 'cash-in' || row.type === 'cash-out') && !row.cancelled && (
-                            <span className={`ml-2 text-xs px-1 py-0.5 text-white rounded ${row.type === 'cash-out' ? 'bg-red-600' : 'bg-emerald-600'}`}>
-                              {row.type === 'cash-out' ? 'CASH OUT' : 'CASH IN'}
+                          {(row.type === "cash-in" || row.type === "cash-out") && !row.cancelled && (
+                            <span className={`ml-2 text-xs px-1 py-0.5 text-white rounded ${row.type === "cash-out" ? "bg-red-600" : "bg-emerald-600"}`}>
+                              {row.type === "cash-out" ? "CASH OUT" : "CASH IN"}
                             </span>
                           )}
-                          {row.paymentMethod === 'credit' && !row.cancelled && (
+                          {row.paymentMethod === "credit" && !row.cancelled && (
                             <span className="ml-2 text-xs px-1 py-0.5 bg-orange-500 text-white rounded">CREDIT</span>
                           )}
                         </td>
-                        <td className={`py-2 px-2 text-right ${row.cancelled ? 'line-through' : ''}`}>
-                          {row.item.quantity}
-                        </td>
-                        <td className={`py-2 px-2 text-right font-semibold ${row.cancelled ? 'line-through' : ''}`}>
-                          ${row.item.subtotal.toFixed(2)}
-                        </td>
+
+                        <td className={`py-2 px-2 text-right ${row.cancelled ? "line-through" : ""}`}>{toNum(row.item.quantity, 0)}</td>
+                        <td className={`py-2 px-2 text-right font-semibold ${row.cancelled ? "line-through" : ""}`}>${money(row.item.subtotal)}</td>
                         <td className="py-2 px-2 text-right font-bold text-indigo-600">
-                          {row.runningBalance !== null ? `$${row.runningBalance.toFixed(2)}` : '-'}
+                          {row.runningBalance !== null ? `$${money(row.runningBalance)}` : "-"}
                         </td>
                       </tr>
                     );
                   })}
                 </tbody>
               </table>
+
+              {dailyRows.length === 0 && <p className="text-gray-500 text-center py-8">No transactions for this date</p>}
             </div>
           </div>
         </div>
@@ -1441,19 +1449,18 @@ export default function POSApp() {
   }
 
   // MAIN POS SCREEN
-  const bgClass = darkMode ? 'bg-gray-900' : 'bg-gradient-to-br from-blue-50 to-indigo-100';
-  const cardBg = darkMode ? 'bg-gray-800' : 'bg-white';
-  const textPrimary = darkMode ? 'text-white' : 'text-gray-900';
-  const textSecondary = darkMode ? 'text-gray-300' : 'text-gray-600';
-  const btnBg = darkMode ? 'bg-gray-700 hover:bg-gray-600' : 'bg-white hover:shadow-md';
-  const btnText = darkMode ? 'text-white' : 'text-gray-700';
-  
+  const bgClass = darkMode ? "bg-gray-900" : "bg-gradient-to-br from-blue-50 to-indigo-100";
+  const cardBg = darkMode ? "bg-gray-800" : "bg-white";
+  const textPrimary = darkMode ? "text-white" : "text-gray-900";
+  const btnBg = darkMode ? "bg-gray-700 hover:bg-gray-600" : "bg-white hover:shadow-md";
+  const btnText = darkMode ? "text-white" : "text-gray-700";
+
   return (
     <div className={`min-h-screen ${bgClass} p-4`}>
       <div className="max-w-7xl mx-auto">
         {/* Header */}
         <div className="flex justify-between items-center mb-6">
-          <h1 className={`text-4xl font-bold ${darkMode ? 'text-indigo-400' : 'text-indigo-600'}`}>POS System</h1>
+          <h1 className={`text-4xl font-bold ${darkMode ? "text-indigo-400" : "text-indigo-600"}`}>POS System</h1>
           <div className="flex gap-1.5">
             <button
               onClick={() => setShowReceiptsView(true)}
@@ -1503,7 +1510,6 @@ export default function POSApp() {
         <div className={`${cardBg} rounded-lg shadow-xl p-6 mb-6`}>
           <h2 className={`text-2xl font-semibold mb-4 ${textPrimary}`}>Items for Sale</h2>
           <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-6 gap-3">
-            {/* New Quick Item Button */}
             <button
               onClick={() => setShowQuickItem(true)}
               className="bg-green-500 text-white p-4 rounded-lg hover:bg-green-600 transition-colors border-2 border-dashed border-green-300"
@@ -1512,8 +1518,7 @@ export default function POSApp() {
               <div className="text-sm">Quick Sale</div>
               <div className="text-xs opacity-75">One-time item</div>
             </button>
-            
-            {/* Cash In/Out Button */}
+
             <button
               onClick={() => setShowCashModal(true)}
               className="bg-emerald-500 text-white p-4 rounded-lg hover:bg-emerald-600 transition-colors border-2 border-dashed border-emerald-300"
@@ -1522,109 +1527,95 @@ export default function POSApp() {
               <div className="text-sm">In/Out</div>
               <div className="text-xs opacity-75">Record cash</div>
             </button>
-            
-            {/* Regular Items */}
-            {items.map(item => (
+
+            {items.map((item) => (
               <button
                 key={item.id}
                 onClick={() => addToSale(item)}
                 className="bg-indigo-500 text-white p-4 rounded-lg hover:bg-indigo-600 transition-colors"
               >
                 <div className="font-bold text-lg">{item.name}</div>
-                <div className="text-sm">${item.price.toFixed(2)}</div>
+                <div className="text-sm">${money(item.price)}</div>
                 <div className="text-xs opacity-75">{item.category}</div>
               </button>
             ))}
           </div>
-          {items.length === 0 && (
-            <p className="text-gray-500 text-center py-8">
-              No items yet. Click "Manage Items" to add items.
-            </p>
-          )}
+
+          {items.length === 0 && <p className="text-gray-500 text-center py-8">No items yet. Click "ITEM" to add items.</p>}
         </div>
 
         {/* Current Sale */}
         {currentSale.length > 0 && (
           <div className={`${cardBg} rounded-lg shadow-xl p-6`}>
             <h2 className={`text-2xl font-semibold mb-4 ${textPrimary}`}>Current Sale</h2>
-            
+
             <div className="space-y-2 mb-4">
-              {currentSale.map(item => (
-                <div key={item.id} className={`flex justify-between items-center p-3 rounded ${darkMode ? 'bg-gray-700' : 'bg-gray-50'}`}>
+              {currentSale.map((item) => (
+                <div key={item.id} className={`flex justify-between items-center p-3 rounded ${darkMode ? "bg-gray-700" : "bg-gray-50"}`}>
                   <span className={`font-medium ${textPrimary}`}>{item.name}</span>
                   <div className="flex items-center gap-3">
                     <button
-                      onClick={() => updateQuantity(item.id, item.quantity - 1)}
-                      className={`w-8 h-8 rounded ${darkMode ? 'bg-gray-600 hover:bg-gray-500' : 'bg-gray-300 hover:bg-gray-400'} ${textPrimary}`}
+                      onClick={() => updateQuantity(item.id, toNum(item.quantity, 0) - 1)}
+                      className={`w-8 h-8 rounded ${darkMode ? "bg-gray-600 hover:bg-gray-500" : "bg-gray-300 hover:bg-gray-400"} ${textPrimary}`}
                     >
                       -
                     </button>
-                    <span className={`w-12 text-center font-semibold ${textPrimary}`}>{item.quantity}</span>
+                    <span className={`w-12 text-center font-semibold ${textPrimary}`}>{toNum(item.quantity, 0)}</span>
                     <button
-                      onClick={() => updateQuantity(item.id, item.quantity + 1)}
-                      className={`w-8 h-8 rounded ${darkMode ? 'bg-gray-600 hover:bg-gray-500' : 'bg-gray-300 hover:bg-gray-400'} ${textPrimary}`}
+                      onClick={() => updateQuantity(item.id, toNum(item.quantity, 0) + 1)}
+                      className={`w-8 h-8 rounded ${darkMode ? "bg-gray-600 hover:bg-gray-500" : "bg-gray-300 hover:bg-gray-400"} ${textPrimary}`}
                     >
                       +
                     </button>
-                    <span className={`w-24 text-right font-bold ${textPrimary}`}>${(item.price * item.quantity).toFixed(2)}</span>
+                    <span className={`w-24 text-right font-bold ${textPrimary}`}>${money(toNum(item.price, 0) * toNum(item.quantity, 0))}</span>
                   </div>
                 </div>
               ))}
             </div>
-            
+
             <div className="mb-4">
               <label className={`block text-sm font-medium mb-1 ${textPrimary}`}>
-                Customer Name {paymentMethod === 'credit' && <span className="text-red-600">*</span>}
+                Customer Name {paymentMethod === "credit" && <span className="text-red-600">*</span>}
               </label>
               <input
                 type="text"
                 value={customerName}
                 onChange={(e) => setCustomerName(e.target.value)}
-                placeholder={paymentMethod === 'credit' ? 'Required for credit sales' : 'Optional'}
-                className={`w-full px-3 py-2 border rounded ${darkMode ? 'bg-gray-700 border-gray-600 text-white' : 'bg-white border-gray-300'}`}
+                placeholder={paymentMethod === "credit" ? "Required for credit sales" : "Optional"}
+                className={`w-full px-3 py-2 border rounded ${darkMode ? "bg-gray-700 border-gray-600 text-white" : "bg-white border-gray-300"}`}
               />
             </div>
-            
+
             <div className="mb-4">
-              <div className={`text-3xl font-bold mb-4 ${darkMode ? 'text-indigo-400' : 'text-indigo-600'}`}>
-                Total: ${currentSale.reduce((sum, i) => sum + (i.price * i.quantity), 0).toFixed(2)}
+              <div className={`text-3xl font-bold mb-4 ${darkMode ? "text-indigo-400" : "text-indigo-600"}`}>
+                Total: ${money(currentSale.reduce((sum, i) => sum + toNum(i.price, 0) * toNum(i.quantity, 0), 0))}
               </div>
             </div>
-            
+
             <div className="flex gap-2 mb-4">
               <button
-                onClick={() => setPaymentMethod('cash')}
+                onClick={() => setPaymentMethod("cash")}
                 className={`flex-1 py-3 rounded font-semibold ${
-                  paymentMethod === 'cash' 
-                    ? 'bg-indigo-600 text-white' 
-                    : darkMode 
-                      ? 'bg-gray-700 text-gray-300' 
-                      : 'bg-gray-200 text-gray-800'
+                  paymentMethod === "cash" ? "bg-indigo-600 text-white" : darkMode ? "bg-gray-700 text-gray-300" : "bg-gray-200 text-gray-800"
                 }`}
               >
                 Cash
               </button>
               <button
-                onClick={() => setPaymentMethod('credit')}
+                onClick={() => setPaymentMethod("credit")}
                 className={`flex-1 py-3 rounded font-semibold ${
-                  paymentMethod === 'credit' 
-                    ? 'bg-indigo-600 text-white' 
-                    : darkMode 
-                      ? 'bg-gray-700 text-gray-300' 
-                      : 'bg-gray-200 text-gray-800'
+                  paymentMethod === "credit" ? "bg-indigo-600 text-white" : darkMode ? "bg-gray-700 text-gray-300" : "bg-gray-200 text-gray-800"
                 }`}
               >
                 Credit
               </button>
             </div>
-            
+
             <button
               onClick={completeSale}
               disabled={isProcessing}
               className={`w-full py-4 rounded-lg font-bold text-lg flex items-center justify-center gap-2 ${
-                isProcessing 
-                  ? 'bg-gray-400 cursor-not-allowed' 
-                  : 'bg-green-600 hover:bg-green-700 text-white'
+                isProcessing ? "bg-gray-400 cursor-not-allowed" : "bg-green-600 hover:bg-green-700 text-white"
               }`}
             >
               {isProcessing ? (
@@ -1633,7 +1624,7 @@ export default function POSApp() {
                   Processing...
                 </>
               ) : (
-                'Complete Sale'
+                "Complete Sale"
               )}
             </button>
           </div>

@@ -25,7 +25,7 @@ export default function LoginPage() {
     });
 
     if (error) setErr(error.message);
-    else router.push("/pos");
+    else router.push("/");
     setLoading(false);
   };
 
